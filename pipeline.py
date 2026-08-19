@@ -1,8 +1,53 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+def _bootstrap_import_path() -> Path:
+    """Ensure project modules import correctly in Colab, CLI, and exec() runs."""
+    project_root: Path | None = None
+
+    try:
+        project_root = Path(__file__).resolve().parent
+    except NameError:
+        project_root = None
+
+    candidates = [
+        project_root,
+        Path("/content/Daikin-Storage"),
+        Path.cwd(),
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if (candidate / "rate_agreement_loader.py").exists():
+            root = str(candidate)
+            if root not in sys.path:
+                sys.path.insert(0, root)
+            return candidate
+
+    if project_root is not None:
+        root = str(project_root)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        return project_root
+
+    raise ModuleNotFoundError(
+        "Could not locate the Daikin-Storage project folder. "
+        "Add it to sys.path before running, e.g.\n"
+        "  import sys\n"
+        "  sys.path.insert(0, '/content/Daikin-Storage')\n"
+        "  from pipeline import run_pipeline\n"
+        "  run_pipeline()"
+    )
+
+
+PROJECT_DIR = _bootstrap_import_path()
+
 import argparse
 from dataclasses import dataclass
-from pathlib import Path
 
 from rate_agreement_loader import (
     RATE_CARD_SHEET as AGREEMENT_SHEET,
