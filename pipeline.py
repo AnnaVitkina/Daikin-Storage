@@ -3,24 +3,25 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Colab: code lives here; data lives on Shared Drive (see paths.py).
+COLAB_CODE_DIR = Path("/content/Daikin-Storage")
+
 
 def _bootstrap_import_path() -> Path:
-    """Ensure project modules import correctly in Colab, CLI, and exec() runs."""
-    project_root: Path | None = None
+    """Ensure local project imports work for CLI and exec(open(...).read()) on Colab."""
+    if COLAB_CODE_DIR.is_dir():
+        root = str(COLAB_CODE_DIR)
+        if root not in sys.path:
+            sys.path.insert(0, root)
 
+    project_root: Path | None = None
     try:
         project_root = Path(__file__).resolve().parent
     except NameError:
         project_root = None
 
-    candidates = [
-        project_root,
-        Path("/content/Daikin-Storage"),
-        Path.cwd(),
-    ]
-
-    for candidate in candidates:
-        if candidate is None:
+    for candidate in (project_root, COLAB_CODE_DIR, Path.cwd()):
+        if candidate is None or not candidate.is_dir():
             continue
         if (candidate / "rate_agreement_loader.py").exists():
             root = str(candidate)
@@ -28,19 +29,11 @@ def _bootstrap_import_path() -> Path:
                 sys.path.insert(0, root)
             return candidate
 
-    if project_root is not None:
-        root = str(project_root)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        return project_root
-
     raise ModuleNotFoundError(
-        "Could not locate the Daikin-Storage project folder. "
-        "Add it to sys.path before running, e.g.\n"
-        "  import sys\n"
-        "  sys.path.insert(0, '/content/Daikin-Storage')\n"
-        "  from pipeline import run_pipeline\n"
-        "  run_pipeline()"
+        "Could not import project modules. Expected Python files in:\n"
+        f"  {COLAB_CODE_DIR}\n\n"
+        "Upload the Daikin-Storage project there, then run:\n"
+        "  exec(open('/content/Daikin-Storage/pipeline.py').read())"
     )
 
 
@@ -236,16 +229,34 @@ def configure_runtime(drive_root: Path | None = None) -> None:
     configure(drive_root=drive_root, use_drive=True if drive_root is not None else None)
 
 
-def main() -> None:
-    args = parse_args()
-    if args.drive_root is not None:
-        configure_runtime(args.drive_root)
-    run_pipeline(
-        rate_card_path=args.rate_card,
-        rate_card_sheets=args.rate_card_sheets,
-        agreement_path=args.agreement,
-        services=args.services,
+def _has_cli_args() -> bool:
+    flags = (
+        "--rate-card",
+        "--rate-card-sheets",
+        "--agreement",
+        "--drive-root",
+        "--services",
+        "-h",
+        "--help",
     )
+    return any(flag in sys.argv for flag in flags)
+
+
+def main() -> None:
+    """Entry point for CLI and for exec(open('/content/Daikin-Storage/pipeline.py').read())."""
+    if _has_cli_args():
+        args = parse_args()
+        if args.drive_root is not None:
+            configure_runtime(args.drive_root)
+        run_pipeline(
+            rate_card_path=args.rate_card,
+            rate_card_sheets=args.rate_card_sheets,
+            agreement_path=args.agreement,
+            services=args.services,
+        )
+        return
+
+    run_pipeline()
 
 
 if __name__ == "__main__":
