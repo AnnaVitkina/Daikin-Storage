@@ -24,7 +24,11 @@ def list_rate_card_files() -> list[Path]:
     if not INPUT_DIR.exists():
         raise FileNotFoundError(f"Input folder not found: {INPUT_DIR}")
 
-    files = sorted(INPUT_DIR.glob("*.xlsx"))
+    files = sorted(
+        path
+        for path in INPUT_DIR.glob("*.xlsx")
+        if not path.name.startswith("~$")
+    )
     if not files:
         raise FileNotFoundError(f"No .xlsx files found in: {INPUT_DIR}")
 
