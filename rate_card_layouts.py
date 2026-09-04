@@ -59,6 +59,20 @@ class PriceColumn:
     desc_col: int
 
 
+@dataclass(frozen=True)
+class WarehouseColumn:
+    """One warehouse price column in a multi-warehouse rate card sheet."""
+
+    col: int
+    label: str
+
+
+_WAREHOUSE_LABEL_PATTERN = re.compile(
+    r"warehouse|sqf\d|ayguemorte|noyelles|bordeaux|lyon",
+    re.IGNORECASE,
+)
+
+
 @dataclass
 class RateCollector:
     """Collect rate values; the first value wins when a lookup key repeats."""
@@ -242,6 +256,162 @@ def _price_column_is_night_shift(df: pd.DataFrame, column: PriceColumn) -> bool:
         return False
 
     return _is_night_shift_price_header(str(cell))
+
+
+def _warehouse_label_for_price_col(
+    df: pd.DataFrame,
+    price_col: int,
+    header_row: int,
+) -> str:
+    """Read the warehouse name associated with a price column."""
+    for row_idx in range(min(header_row, 5)):
+        for col_idx in (price_col - 1, price_col - 2, price_col):
+            if col_idx < 0 or col_idx >= len(df.columns):
+                continue
+
+            cell = df.iloc[row_idx, col_idx]
+            if pd.isna(cell):
+                continue
+
+            text = str(cell).strip()
+            if not text or _is_noise_label(text):
+                continue
+
+            if _WAREHOUSE_LABEL_PATTERN.search(text):
+                return text
+
+    if price_col > 0:
+        cell = df.iloc[0, price_col - 1]
+        if pd.notna(cell) and str(cell).strip():
+            return str(cell).strip()
+
+    return f"Column {price_col + 1}"
+
+
+def discover_warehouse_columns(
+    df: pd.DataFrame,
+    layout: RateCardLayout,
+    price_columns: list[PriceColumn] | None = None,
+) -> list[WarehouseColumn]:
+    """Return warehouse price columns when a sheet has multiple warehouse tables."""
+    columns = price_columns or _find_all_price_columns(df, layout)
+    if len(columns) < 2:
+        return []
+
+    warehouses: list[WarehouseColumn] = []
+    for column in columns:
+        if _price_column_is_night_shift(df, column):
+            continue
+
+        label = _warehouse_label_for_price_col(df, column.col, column.header_row)
+        warehouses.append(WarehouseColumn(col=column.col, label=label))
+
+    if len(warehouses) < 2:
+        return []
+
+    unique_labels = {_normalize_key(warehouse.label) for warehouse in warehouses}
+    if len(unique_labels) < 2:
+        return []
+
+    return warehouses
+
+
+def list_warehouse_columns_from_file(rate_card_path: Path) -> list[WarehouseColumn]:
+    """List warehouse tables from the first processable sheet in a rate card file."""
+    with pd.ExcelFile(rate_card_path, engine="openpyxl") as workbook:
+        for sheet_name in workbook.sheet_names:
+            df = pd.read_excel(workbook, sheet_name=sheet_name, header=None)
+            layout = detect_rate_card_layout(df, rate_card_path.name)
+            if layout is None:
+                continue
+
+            warehouses = discover_warehouse_columns(df, layout)
+            if warehouses:
+                return warehouses
+
+    return []
+
+
+def choose_warehouse_column(warehouses: list[WarehouseColumn]) -> int:
+    """Prompt the user to choose one warehouse price table."""
+    if not warehouses:
+        raise ValueError("No warehouse tables available to choose from.")
+
+    if len(warehouses) == 1:
+        return warehouses[0].col
+
+    print("\nMultiple warehouse rate tables found in the rate card:")
+    for index, warehouse in enumerate(warehouses, start=1):
+        print(f"  {index}. {warehouse.label} (Excel column {warehouse.col + 1})")
+
+    while True:
+        choice = input("Enter warehouse table number: ").strip()
+        if not choice.isdigit():
+            print("Please enter a valid number.")
+            continue
+
+        selected_index = int(choice)
+        if 1 <= selected_index <= len(warehouses):
+            selected = warehouses[selected_index - 1]
+            print(f"Using warehouse table: {selected.label}")
+            return selected.col
+
+        print(f"Please enter a number between 1 and {len(warehouses)}.")
+
+
+def resolve_warehouse_price_col(
+    warehouses: list[WarehouseColumn],
+    warehouse: str | int | None = None,
+    *,
+    interactive: bool = True,
+) -> int | None:
+    """Resolve a warehouse selector to a price column index."""
+    if not warehouses:
+        return None
+
+    if len(warehouses) == 1:
+        return warehouses[0].col
+
+    if warehouse is not None:
+        if isinstance(warehouse, int):
+            for item in warehouses:
+                if item.col == warehouse:
+                    return warehouse
+            valid = ", ".join(str(item.col) for item in warehouses)
+            raise ValueError(
+                f"Warehouse column {warehouse} not found. Valid columns: {valid}"
+            )
+
+        target = _normalize_key(str(warehouse))
+        for item in warehouses:
+            label = _normalize_key(item.label)
+            if target in label or label in target:
+                return item.col
+
+        options = ", ".join(item.label for item in warehouses)
+        raise ValueError(
+            f"No warehouse table matches '{warehouse}'. Available: {options}"
+        )
+
+    if interactive:
+        return choose_warehouse_column(warehouses)
+
+    options = ", ".join(item.label for item in warehouses)
+    raise ValueError(
+        "Rate card contains multiple warehouse tables. "
+        f"Choose one with --warehouse, e.g. --warehouse \"Bordeaux\". Available: {options}"
+    )
+
+
+def warehouse_label_for_column(
+    warehouses: list[WarehouseColumn],
+    price_col: int,
+) -> str | None:
+    """Return the label for a selected warehouse price column."""
+    for warehouse in warehouses:
+        if warehouse.col == price_col:
+            return warehouse.label
+    return None
 
 
 def _find_all_price_columns(df: pd.DataFrame, layout: RateCardLayout) -> list[PriceColumn]:
@@ -799,11 +969,19 @@ def _extract_rates_from_sheet(
     df: pd.DataFrame,
     layout: RateCardLayout,
     collector: RateCollector,
+    warehouse_price_col: int | None = None,
 ) -> None:
     """Extract rates from one sheet, including multi-column and multi-row entries."""
     price_columns = _find_all_price_columns(df, layout)
     if not price_columns:
         return
+
+    if warehouse_price_col is not None:
+        price_columns = [column for column in price_columns if column.col == warehouse_price_col]
+        if not price_columns:
+            raise ValueError(
+                f"Warehouse price column {warehouse_price_col} not found in sheet."
+            )
 
     if _is_revision_period_columns(df, price_columns):
         price_columns = _extend_revision_price_columns(df, price_columns)
@@ -871,19 +1049,22 @@ def _extract_rates_from_sheet(
                 collector.add(description, price)
             continue
 
-        row_min_price = min(price for _, price, _ in row_entries)
-        for description, _, _ in row_entries:
-            collector.add(description, row_min_price)
+        for description, price, _ in row_entries:
+            collector.add(description, price)
 
 
-def build_rate_lookup_from_dataframe(df: pd.DataFrame, filename: str = "") -> dict[str, float]:
+def build_rate_lookup_from_dataframe(
+    df: pd.DataFrame,
+    filename: str = "",
+    warehouse_price_col: int | None = None,
+) -> dict[str, float]:
     """Build a lookup dictionary from an in-memory rate card sheet."""
     layout = detect_rate_card_layout(df, filename)
     if layout is None:
         raise ValueError(f"Unsupported rate card layout in '{filename}'")
 
     collector = RateCollector()
-    _extract_rates_from_sheet(df, layout, collector)
+    _extract_rates_from_sheet(df, layout, collector, warehouse_price_col)
     lookup = collector.as_lookup()
 
     if not lookup:
@@ -930,8 +1111,22 @@ def validate_rate_card_file(file_path: Path) -> list[tuple[str, bool, str, int]]
     return results
 
 
-def build_rate_lookup(rate_card_path: Path) -> dict[str, float]:
+def build_rate_lookup(
+    rate_card_path: Path,
+    warehouse: str | int | None = None,
+    *,
+    warehouse_price_col: int | None = None,
+    interactive: bool = True,
+) -> dict[str, float]:
     """Build a rate lookup dictionary from a processed rate card file."""
+    if warehouse_price_col is None:
+        warehouses = list_warehouse_columns_from_file(rate_card_path)
+        warehouse_price_col = resolve_warehouse_price_col(
+            warehouses,
+            warehouse,
+            interactive=interactive,
+        )
+
     collector = RateCollector()
 
     with pd.ExcelFile(rate_card_path, engine="openpyxl") as workbook:
@@ -941,7 +1136,7 @@ def build_rate_lookup(rate_card_path: Path) -> dict[str, float]:
             if layout is None:
                 continue
 
-            _extract_rates_from_sheet(df, layout, collector)
+            _extract_rates_from_sheet(df, layout, collector, warehouse_price_col)
 
     lookup = collector.as_lookup()
     if not lookup:
