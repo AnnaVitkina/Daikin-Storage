@@ -73,6 +73,9 @@ def run_pipeline(
     rate_card_sheets: list[str] | None = None,
     agreement_path: Path | None = None,
     services: list[str] | None = None,
+    warehouse: str | int | None = None,
+    *,
+    interactive: bool = True,
 ) -> PipelineResult:
     """
     Run the full rate card processing pipeline end to end.
@@ -134,6 +137,8 @@ def run_pipeline(
         rate_card_path=rate_card_processed,
         sheet_name=AGREEMENT_SHEET,
         services=services,
+        warehouse=warehouse,
+        interactive=interactive,
     )
 
     print(f"\nApplied costs for services: {', '.join(services)}")
@@ -212,6 +217,13 @@ def parse_args() -> argparse.Namespace:
         help=f"Service row(s) to update (default: {', '.join(DEFAULT_SERVICES)}).",
     )
     parser.add_argument(
+        "--warehouse",
+        help=(
+            "Warehouse rate table to use when the rate card has multiple warehouse "
+            "columns (name substring or Excel column index, e.g. Bordeaux or 8)."
+        ),
+    )
+    parser.add_argument(
         "--drive-root",
         type=Path,
         help=(
@@ -229,6 +241,15 @@ def configure_runtime(drive_root: Path | None = None) -> None:
     configure(drive_root=drive_root, use_drive=True if drive_root is not None else None)
 
 
+def _parse_warehouse_arg(value: str | None) -> str | int | None:
+    if value is None:
+        return None
+    if value.isdigit():
+        # CLI users think in 1-based Excel columns; convert to 0-based index.
+        return int(value) - 1
+    return value
+
+
 def _has_cli_args() -> bool:
     flags = (
         "--rate-card",
@@ -236,6 +257,7 @@ def _has_cli_args() -> bool:
         "--agreement",
         "--drive-root",
         "--services",
+        "--warehouse",
         "-h",
         "--help",
     )
@@ -253,6 +275,8 @@ def main() -> None:
             rate_card_sheets=args.rate_card_sheets,
             agreement_path=args.agreement,
             services=args.services,
+            warehouse=_parse_warehouse_arg(args.warehouse),
+            interactive=args.warehouse is None,
         )
         return
 
