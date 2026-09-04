@@ -13,7 +13,13 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from cost_mappings import CostMappings, load_cost_mappings
 from paths import OUTPUT_DIR, PROCESSING_DIR, RATE_AGREEMENT_INPUT_DIR
-from rate_card_layouts import build_rate_lookup, describe_detected_layout
+from rate_card_layouts import (
+    build_rate_lookup,
+    describe_detected_layout,
+    list_warehouse_columns_from_file,
+    resolve_warehouse_price_col,
+    warehouse_label_for_column,
+)
 
 AGREEMENT_INPUT_DIR = RATE_AGREEMENT_INPUT_DIR
 RATE_CARD_PROCESSING_DIR = PROCESSING_DIR
@@ -831,6 +837,9 @@ def apply_rate_card_to_agreement(
     sheet_name: str = RATE_CARD_SHEET,
     services: list[str] | None = None,
     mappings_path: Path | None = None,
+    warehouse: str | int | None = None,
+    *,
+    interactive: bool = True,
 ) -> tuple[Path, list[dict[str, object]], list[dict[str, object]]]:
     """
     Apply rate card costs to a rate agreement file and save to the output folder.
@@ -843,7 +852,23 @@ def apply_rate_card_to_agreement(
     cost_mappings = load_cost_mappings(mappings_path)
     print(f"Loaded {len(cost_mappings.entries)} cost mappings from txt")
     print(f"Detected rate card layout: {describe_detected_layout(rate_card_path)}")
-    rate_lookup = build_rate_lookup(rate_card_path)
+
+    warehouses = list_warehouse_columns_from_file(rate_card_path)
+    warehouse_price_col = resolve_warehouse_price_col(
+        warehouses,
+        warehouse,
+        interactive=interactive,
+    )
+    if warehouse_price_col is not None:
+        label = warehouse_label_for_column(warehouses, warehouse_price_col)
+        print(f"Using warehouse table: {label} (column {warehouse_price_col + 1})")
+
+    rate_lookup = build_rate_lookup(
+        rate_card_path,
+        warehouse,
+        warehouse_price_col=warehouse_price_col,
+        interactive=interactive,
+    )
     print(f"Loaded {len({k for k in rate_lookup if isinstance(k, str)})} rate card lookup keys")
     output_path = OUTPUT_DIR / f"{agreement_path.stem}_updated.xlsx"
     shutil.copy2(agreement_path, output_path)
