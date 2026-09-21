@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
-from cost_mappings import CostMappings, load_cost_mappings
+from cost_mappings import CostMappings, DIVIDE_BY_DECIMAL_PLACES, load_cost_mappings
 from paths import OUTPUT_DIR, PROCESSING_DIR, RATE_AGREEMENT_INPUT_DIR
 from rate_card_layouts import (
     build_rate_lookup,
@@ -49,6 +49,9 @@ MINIMUM_CHARGE_LOOKUP_KEYS = (
 THRESHOLD_PATTERN = re.compile(r"(?P<op><=|>=|≤|≥|<|>)\s*(?P<value>[\d.,]+)")
 VOLUME_RATE_HINTS = ("volume/cbm", "volume/cbn", "0.002")
 SMALL_VALUE_THRESHOLD = 0.01
+# Parenthetical fragments like "FU" / "SPP" must not exact-match rate card keys
+# extracted from "Unload carton boxes (FU)" before Storage Fee mappings run.
+MIN_EXACT_NAME_MATCH_LENGTH = 8
 
 
 def list_agreement_files() -> list[Path]:
@@ -491,6 +494,21 @@ def decimal_places_of(value) -> int | None:
     return len(match.group(1))
 
 
+def round_to_decimal_places(
+    value: float,
+    places: int,
+    *,
+    as_string: bool = False,
+) -> float | str:
+    """Round a numeric value to a fixed number of decimal places (half-up)."""
+    quantized = Decimal(str(value)).quantize(
+        Decimal("1").scaleb(-places),
+        rounding=ROUND_HALF_UP,
+    )
+    formatted = f"{quantized:.{places}f}"
+    return formatted if as_string else float(formatted)
+
+
 def round_value_to_original_decimals(new_value: float, original_value) -> float | str:
     """
     Round an updated cost to the same number of decimals as the original cell.
@@ -502,16 +520,11 @@ def round_value_to_original_decimals(new_value: float, original_value) -> float 
     if places is None:
         return new_value
 
-    quantized = Decimal(str(new_value)).quantize(
-        Decimal("1").scaleb(-places),
-        rounding=ROUND_HALF_UP,
+    return round_to_decimal_places(
+        new_value,
+        places,
+        as_string=isinstance(original_value, str),
     )
-    formatted = f"{quantized:.{places}f}"
-
-    if isinstance(original_value, str):
-        return formatted
-
-    return float(formatted)
 
 
 def find_rate_value(
@@ -521,13 +534,12 @@ def find_rate_value(
     cost_mappings: CostMappings | None = None,
     prefer_night_shift: bool = False,
     prefer_minimum_charge: bool = False,
-) -> tuple[float | None, str | None, str | None]:
+) -> tuple[float | None, str | None, str | None, int | None]:
     """
     Find a rate card value.
 
-    Priority:
-    1. Cost mappings txt
-    2. Existing agreement header/name matching
+    Returns (value, matched_key, match_source, forced_decimal_places).
+    forced_decimal_places is set for rules like Divide by: 30 (always 3 dp).
     """
     header_texts = header_texts or []
     night_suffix = normalize_key(NIGHT_SHIFT_SUFFIX)
@@ -538,18 +550,21 @@ def find_rate_value(
             prefer_night_shift=prefer_night_shift,
         )
         if value is not None:
-            return value, matched_key, "minimum"
+            return value, matched_key, "minimum", None
 
     # Exact rate-card name match first (e.g. "Transport automatic trailer" in
     # "Transport cost (Transport automatic trailer)"). Must beat mappings so a
     # loose alias like "Handling IN" from Applies-if text cannot steal the value.
+    # Skip short fragments ("FU", "SPP") — those collide with unrelated rate keys.
     for candidate in lookup_keys:
         for key in (
             with_night_shift_suffix(candidate) if prefer_night_shift else candidate,
             normalize_key(with_night_shift_suffix(candidate) if prefer_night_shift else candidate),
         ):
+            if len(normalize_key(str(key))) < MIN_EXACT_NAME_MATCH_LENGTH:
+                continue
             if key in rate_lookup:
-                return rate_lookup[key], candidate, "name"
+                return rate_lookup[key], candidate, "name", None
 
     if cost_mappings and cost_mappings.entries:
         for entry in cost_mappings.matching_entries(header_texts, lookup_keys):
@@ -563,9 +578,18 @@ def find_rate_value(
 
             if entry.percent is not None:
                 scaled = value * (entry.percent / 100.0)
-                return scaled, f"{matched_key} * {entry.percent:g}%", "mapping"
+                return scaled, f"{matched_key} * {entry.percent:g}%", "mapping", None
 
-            return value, matched_key, "mapping"
+            if entry.divide_by is not None and entry.divide_by != 0:
+                scaled = value / entry.divide_by
+                return (
+                    scaled,
+                    f"{matched_key} / {entry.divide_by:g}",
+                    "mapping",
+                    DIVIDE_BY_DECIMAL_PLACES,
+                )
+
+            return value, matched_key, "mapping", None
 
     for candidate in lookup_keys:
         if prefer_night_shift:
@@ -586,14 +610,14 @@ def find_rate_value(
             shorter, longer = sorted((norm_candidate, norm_rate_key), key=len)
             # Reject short fragments like "handling" matching any Handling Fee column.
             if len(shorter) >= 12 and (shorter in longer or longer in shorter):
-                return value, rate_key, "name"
+                return value, rate_key, "name", None
 
             tokens = _lookup_partial_tokens(candidate)
             if len(tokens) >= 2 and all(token in norm_rate_key for token in tokens):
-                return value, rate_key, "name"
+                return value, rate_key, "name", None
 
             if len(tokens) == 1 and len(tokens[0]) >= 8 and tokens[0] in norm_rate_key:
-                return value, rate_key, "name"
+                return value, rate_key, "name", None
 
     if prefer_night_shift:
         for candidate in lookup_keys:
@@ -611,13 +635,13 @@ def find_rate_value(
 
                 base_rate_key = norm_rate_key[: -len(normalize_key(NIGHT_SHIFT_SUFFIX))].strip()
                 if norm_candidate in base_rate_key or base_rate_key in norm_candidate:
-                    return value, rate_key, "name"
+                    return value, rate_key, "name", None
 
                 tokens = _lookup_partial_tokens(candidate)
                 if len(tokens) >= 2 and all(token in base_rate_key for token in tokens):
-                    return value, rate_key, "name"
+                    return value, rate_key, "name", None
 
-    return None, None, None
+    return None, None, None, None
 
 
 def get_merged_cell_value(ws: Worksheet, row: int, col: int):
@@ -854,7 +878,7 @@ def apply_costs_to_service_rows(
             header_texts = list(pair.get("header_texts", []))
             prefer_night_shift = header_is_night_shift(header_texts)
             prefer_minimum_charge = header_is_minimum_charge(header_texts)
-            new_value, matched_key, match_source = find_rate_value(
+            new_value, matched_key, match_source, forced_decimals = find_rate_value(
                 lookup_keys,
                 rate_lookup,
                 header_texts=header_texts,
@@ -874,7 +898,14 @@ def apply_costs_to_service_rows(
                 )
                 continue
 
-            rounded_value = round_value_to_original_decimals(new_value, current_value)
+            if forced_decimals is not None:
+                rounded_value = round_to_decimal_places(
+                    new_value,
+                    forced_decimals,
+                    as_string=isinstance(current_value, str),
+                )
+            else:
+                rounded_value = round_value_to_original_decimals(new_value, current_value)
             value_cell.value = rounded_value
             value_cell.fill = GREEN_FILL
 
