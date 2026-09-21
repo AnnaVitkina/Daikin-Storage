@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 
 from collections import defaultdict
@@ -461,6 +462,58 @@ def is_small_placeholder_value(value) -> bool:
     return abs(numeric) < SMALL_VALUE_THRESHOLD
 
 
+def decimal_places_of(value) -> int | None:
+    """
+    Count digits after the decimal point in an existing agreement value.
+
+    Examples: '7.91' -> 2, '87.57' -> 2, 10 -> 0, '0.01' -> 2.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, int):
+        return 0
+
+    text = str(value).strip().replace(" ", "").replace(",", ".")
+    if not text:
+        return None
+
+    if re.fullmatch(r"-?\d+", text):
+        return 0
+
+    match = re.fullmatch(r"-?\d+\.(\d+)", text)
+    if not match:
+        return None
+
+    return len(match.group(1))
+
+
+def round_value_to_original_decimals(new_value: float, original_value) -> float | str:
+    """
+    Round an updated cost to the same number of decimals as the original cell.
+
+    Uses half-up rounding (7.907... with 2 decimals -> 7.91).
+    Preserves string format when the original agreement value was text.
+    """
+    places = decimal_places_of(original_value)
+    if places is None:
+        return new_value
+
+    quantized = Decimal(str(new_value)).quantize(
+        Decimal("1").scaleb(-places),
+        rounding=ROUND_HALF_UP,
+    )
+    formatted = f"{quantized:.{places}f}"
+
+    if isinstance(original_value, str):
+        return formatted
+
+    return float(formatted)
+
+
 def find_rate_value(
     lookup_keys: list[str],
     rate_lookup: dict[str, float],
@@ -487,17 +540,9 @@ def find_rate_value(
         if value is not None:
             return value, matched_key, "minimum"
 
-    if cost_mappings and cost_mappings.entries:
-        mapped_names = cost_mappings.agreement_candidates(header_texts, lookup_keys)
-        for rate_card_name in mapped_names:
-            value, matched_key = lookup_rate_card_value(
-                rate_card_name,
-                rate_lookup,
-                prefer_night_shift=prefer_night_shift,
-            )
-            if value is not None:
-                return value, matched_key, "mapping"
-
+    # Exact rate-card name match first (e.g. "Transport automatic trailer" in
+    # "Transport cost (Transport automatic trailer)"). Must beat mappings so a
+    # loose alias like "Handling IN" from Applies-if text cannot steal the value.
     for candidate in lookup_keys:
         for key in (
             with_night_shift_suffix(candidate) if prefer_night_shift else candidate,
@@ -505,6 +550,22 @@ def find_rate_value(
         ):
             if key in rate_lookup:
                 return rate_lookup[key], candidate, "name"
+
+    if cost_mappings and cost_mappings.entries:
+        for entry in cost_mappings.matching_entries(header_texts, lookup_keys):
+            value, matched_key = lookup_rate_card_value(
+                entry.rate_card_name,
+                rate_lookup,
+                prefer_night_shift=prefer_night_shift,
+            )
+            if value is None:
+                continue
+
+            if entry.percent is not None:
+                scaled = value * (entry.percent / 100.0)
+                return scaled, f"{matched_key} * {entry.percent:g}%", "mapping"
+
+            return value, matched_key, "mapping"
 
     for candidate in lookup_keys:
         if prefer_night_shift:
@@ -522,7 +583,9 @@ def find_rate_value(
             if norm_rate_key.endswith(night_suffix):
                 continue
 
-            if norm_candidate in norm_rate_key or norm_rate_key in norm_candidate:
+            shorter, longer = sorted((norm_candidate, norm_rate_key), key=len)
+            # Reject short fragments like "handling" matching any Handling Fee column.
+            if len(shorter) >= 12 and (shorter in longer or longer in shorter):
                 return value, rate_key, "name"
 
             tokens = _lookup_partial_tokens(candidate)
@@ -811,7 +874,8 @@ def apply_costs_to_service_rows(
                 )
                 continue
 
-            value_cell.value = new_value
+            rounded_value = round_value_to_original_decimals(new_value, current_value)
+            value_cell.value = rounded_value
             value_cell.fill = GREEN_FILL
 
             updates.append(
@@ -823,7 +887,7 @@ def apply_costs_to_service_rows(
                     "lookup_key": matched_key,
                     "match_source": match_source,
                     "old_value": current_value,
-                    "new_value": new_value,
+                    "new_value": rounded_value,
                     "action": "updated_green",
                 }
             )
