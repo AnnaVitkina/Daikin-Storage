@@ -262,9 +262,9 @@ def _warehouse_label_for_price_col(
     df: pd.DataFrame,
     price_col: int,
     header_row: int,
-) -> str:
-    """Read the warehouse name associated with a price column."""
-    for row_idx in range(min(header_row, 5)):
+) -> str | None:
+    """Read the warehouse name for a price column, or None if not a warehouse table."""
+    for row_idx in range(min(header_row + 1, 8)):
         for col_idx in (price_col - 1, price_col - 2, price_col):
             if col_idx < 0 or col_idx >= len(df.columns):
                 continue
@@ -277,15 +277,13 @@ def _warehouse_label_for_price_col(
             if not text or _is_noise_label(text):
                 continue
 
+            if _parse_number(text) is not None:
+                continue
+
             if _WAREHOUSE_LABEL_PATTERN.search(text):
                 return text
 
-    if price_col > 0:
-        cell = df.iloc[0, price_col - 1]
-        if pd.notna(cell) and str(cell).strip():
-            return str(cell).strip()
-
-    return f"Column {price_col + 1}"
+    return None
 
 
 def discover_warehouse_columns(
@@ -293,9 +291,17 @@ def discover_warehouse_columns(
     layout: RateCardLayout,
     price_columns: list[PriceColumn] | None = None,
 ) -> list[WarehouseColumn]:
-    """Return warehouse price columns when a sheet has multiple warehouse tables."""
+    """
+    Return warehouse price columns when a sheet has multiple warehouse tables.
+
+    Revision-year COST columns (REV2021, REV2022, ...) are not warehouses — those
+    are handled separately by picking the latest revision.
+    """
     columns = price_columns or _find_all_price_columns(df, layout)
     if len(columns) < 2:
+        return []
+
+    if _is_revision_period_columns(df, columns):
         return []
 
     warehouses: list[WarehouseColumn] = []
@@ -304,6 +310,9 @@ def discover_warehouse_columns(
             continue
 
         label = _warehouse_label_for_price_col(df, column.col, column.header_row)
+        if label is None:
+            continue
+
         warehouses.append(WarehouseColumn(col=column.col, label=label))
 
     if len(warehouses) < 2:
