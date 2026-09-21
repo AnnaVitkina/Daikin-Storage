@@ -46,6 +46,7 @@ AGREEMENT_PREFIXES: tuple[str, ...] = (
 
 SEPARATOR_PATTERN = re.compile(r"^=+\s*$")
 RATE_BY_PATTERN = re.compile(r"\s\+\s*Rate by:\s*(.+)$", re.IGNORECASE)
+PERCENT_PATTERN = re.compile(r"\s\+\s*Percent:\s*([\d.,]+)\s*%?\s*$", re.IGNORECASE)
 OR_SPLIT_PATTERN = re.compile(r"\s+or\s+", re.IGNORECASE)
 
 
@@ -54,14 +55,19 @@ class CostMappingEntry:
     rate_card_name: str
     agreement_aliases: list[str] = field(default_factory=list)
     rate_by: str | None = None
+    percent: float | None = None
 
 
 @dataclass
 class CostMappings:
     entries: list[CostMappingEntry] = field(default_factory=list)
 
-    def agreement_candidates(self, header_texts: list[str], lookup_keys: list[str]) -> list[str]:
-        """Return rate card names that match the agreement column headers."""
+    def matching_entries(
+        self,
+        header_texts: list[str],
+        lookup_keys: list[str],
+    ) -> list[CostMappingEntry]:
+        """Return mapping entries that match the agreement column headers, best first."""
         matched_entries: list[tuple[int, CostMappingEntry]] = []
 
         for entry in self.entries:
@@ -78,18 +84,20 @@ class CostMappings:
 
         matched_entries.sort(key=lambda item: item[0], reverse=True)
 
-        matched_rate_cards: list[str] = []
+        result: list[CostMappingEntry] = []
         seen: set[str] = set()
-
         for _, entry in matched_entries:
-            normalized = _normalize(entry.rate_card_name)
-            if normalized in seen:
+            key = f"{_normalize(entry.rate_card_name)}|{entry.percent}|{entry.rate_by}"
+            if key in seen:
                 continue
+            seen.add(key)
+            result.append(entry)
 
-            seen.add(normalized)
-            matched_rate_cards.append(entry.rate_card_name)
+        return result
 
-        return matched_rate_cards
+    def agreement_candidates(self, header_texts: list[str], lookup_keys: list[str]) -> list[str]:
+        """Return rate card names that match the agreement column headers."""
+        return [entry.rate_card_name for entry in self.matching_entries(header_texts, lookup_keys)]
 
 
 def _normalize(value: str) -> str:
@@ -111,6 +119,12 @@ def _header_has_rate_by(header_texts: list[str], lookup_keys: list[str]) -> bool
     return "rate by:" in _combined_blob(header_texts, lookup_keys)
 
 
+def _is_auxiliary_header(text: str) -> bool:
+    """Return True for Applies-if / Rate-by lines that are not cost category names."""
+    normalized = _normalize(text)
+    return normalized.startswith(("applies if", "rate by:", "rate by "))
+
+
 def _category_matches(alias: str, header_texts: list[str], lookup_keys: list[str]) -> bool:
     """Match a mapping alias against agreement header category names only."""
     del lookup_keys  # Fragments like OUT/Outbound must not drive mapping matches.
@@ -129,18 +143,19 @@ def _category_matches(alias: str, header_texts: list[str], lookup_keys: list[str
         if primary_norm.startswith(f"{alias_norm} ") and "(" in primary_norm:
             return False
 
+    # Only real category headers — never Applies-if / Rate-by text.
+    # Substring matches against Applies-if (e.g. "Handling IN/Automatic Trailer")
+    # would wrongly map Transport cost columns to HANDLING IN rates.
     header_categories = [
         _normalize(str(text).split("|")[0].strip())
         for text in header_texts
-        if str(text).strip()
+        if str(text).strip() and not _is_auxiliary_header(str(text))
     ]
 
     for text_norm in header_categories:
         if not text_norm or text_norm == primary_norm:
             continue
         if alias_norm == text_norm:
-            return True
-        if alias_norm in text_norm:
             return True
 
     return False
@@ -208,21 +223,35 @@ def _split_mapping_line(line: str) -> tuple[str, str] | None:
     return None
 
 
-def _parse_agreement_side(agreement_part: str) -> tuple[list[str], str | None]:
+def _parse_number_suffix(value: str) -> float | None:
+    text = value.strip().replace(" ", "").replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_agreement_side(agreement_part: str) -> tuple[list[str], str | None, float | None]:
     """
-    Split agreement aliases and optional Rate by suffix.
+    Split agreement aliases and optional Rate by / Percent suffixes.
 
     Agreement aliases separated by `` or `` are alternative header names for the
     same rate card cost (either name may appear in the agreement), for example::
 
         Handling Fee (OUT, End customer) or Handling Fee (HANDLING OUT FP - ...)
-    """
-    rate_by_match = RATE_BY_PATTERN.search(agreement_part)
-    rate_by = rate_by_match.group(1).strip() if rate_by_match else None
 
-    agreement_text = RATE_BY_PATTERN.sub("", agreement_part).strip()
+    Optional ``+ Percent: 45`` means use 45% of the mapped rate card value.
+    """
+    percent_match = PERCENT_PATTERN.search(agreement_part)
+    percent = _parse_number_suffix(percent_match.group(1)) if percent_match else None
+    agreement_text = PERCENT_PATTERN.sub("", agreement_part).strip()
+
+    rate_by_match = RATE_BY_PATTERN.search(agreement_text)
+    rate_by = rate_by_match.group(1).strip() if rate_by_match else None
+    agreement_text = RATE_BY_PATTERN.sub("", agreement_text).strip()
+
     aliases = [part.strip() for part in OR_SPLIT_PATTERN.split(agreement_text) if part.strip()]
-    return aliases, rate_by
+    return aliases, rate_by, percent
 
 
 def load_cost_mappings(path: Path | None = None) -> CostMappings:
@@ -243,7 +272,7 @@ def load_cost_mappings(path: Path | None = None) -> CostMappings:
             continue
 
         rate_card_name, agreement_part = split
-        agreement_aliases, rate_by = _parse_agreement_side(agreement_part)
+        agreement_aliases, rate_by, percent = _parse_agreement_side(agreement_part)
         if not agreement_aliases:
             continue
 
@@ -252,6 +281,7 @@ def load_cost_mappings(path: Path | None = None) -> CostMappings:
                 rate_card_name=rate_card_name,
                 agreement_aliases=agreement_aliases,
                 rate_by=rate_by,
+                percent=percent,
             )
         )
 
